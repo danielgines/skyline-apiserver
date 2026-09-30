@@ -33,9 +33,11 @@ from skyline_apiserver.api import deps
 from skyline_apiserver.client import utils
 from skyline_apiserver.client.openstack.keystone import get_token_data, get_user, revoke_token
 from skyline_apiserver.client.openstack.system import (
+    get_domain_scope_token,
     get_endpoints,
     get_project_scope_token,
     get_projects,
+    get_scope_domains,
 )
 from skyline_apiserver.client.utils import generate_session, get_system_session
 from skyline_apiserver.config import CONF
@@ -118,6 +120,31 @@ def _get_projects_and_unscope_token(
     return project_scope, unscope_token, default_project_id  # type: ignore
 
 
+def _get_domain_scope_token(
+    unscope_token: str, region: str, user_domain: Optional[str] = None
+) -> Optional[str]:
+    """Domain-scoped token for the user's own domain, or None.
+
+    Only users with role assignments on a domain (Keystone domain manager persona)
+    get one. Failures never block the login: the session just has no domain area.
+    """
+    try:
+        domains = [d for d in get_scope_domains(unscope_token, region) if d.enabled]
+        if user_domain:
+            own = [d for d in domains if d.name == user_domain or d.id == user_domain]
+            domains = own or []
+        if not domains:
+            return None
+        return get_domain_scope_token(
+            keystone_token=unscope_token,
+            region=region,
+            domain_id=domains[0].id,
+        )
+    except Exception as e:
+        LOG.debug(f"No domain-scoped token: {str(e)}")
+        return None
+
+
 def _patch_profile(profile: schemas.Profile, global_request_id: str) -> schemas.Profile:
     try:
         profile.endpoints = get_endpoints(region=profile.region)
@@ -196,10 +223,12 @@ def login(
             region=region,
             project_id=default_project_id or project_scope[0].id,
         )
+        domain_scope_token = _get_domain_scope_token(unscope_token, region, domain)
 
         profile = generate_profile(
             keystone_token=project_scope_token,
             region=region,
+            domain_scope_token=domain_scope_token,
         )
 
         profile = _patch_profile(profile, x_openstack_request_id)
@@ -225,7 +254,10 @@ def login(
     response_description="OK",
 )
 def get_config(request: Request) -> schemas.Config:
-    return schemas.Config(default_domain=CONF.openstack.user_default_domain)
+    return schemas.Config(
+        default_domain=CONF.openstack.user_default_domain,
+        domain_manager_roles=CONF.openstack.domain_manager_roles,
+    )
 
 
 @router.get(
@@ -307,10 +339,12 @@ def websso(
             region=CONF.openstack.sso_region,
             project_id=default_project_id or project_scope[0].id,
         )
+        domain_scope_token = _get_domain_scope_token(token, CONF.openstack.sso_region)
 
         profile = generate_profile(
             keystone_token=project_scope_token,
             region=CONF.openstack.sso_region,
+            domain_scope_token=domain_scope_token,
         )
 
         profile = _patch_profile(profile, x_openstack_request_id)
@@ -374,6 +408,8 @@ def logout(
             profile = generate_profile_by_token(token)
             session = generate_session(profile)
             revoke_token(profile, session, x_openstack_request_id, token.keystone_token)
+            if token.domain_scope_token:
+                revoke_token(profile, session, x_openstack_request_id, token.domain_scope_token)
             db_api.revoke_token(profile.uuid, profile.exp)
         except Exception as e:
             LOG.debug(str(e))
@@ -413,6 +449,7 @@ def switch_project(
         new_profile = generate_profile(
             keystone_token=project_scope_token,
             region=region,
+            domain_scope_token=profile.domain_scope_token,
         )
         new_profile = _patch_profile(new_profile, x_openstack_request_id)
     except Exception as e:
